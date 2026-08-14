@@ -198,13 +198,22 @@ def process_ingestion(
     target_filename: str = "ibm_annual_report.pdf"
 ):
     """Executes the full ingestion and chunking pipeline."""
-    pdf_path = Path(raw_dir) / target_filename
-    output_path = Path(processed_dir) / "chunks.json"
+    raw_path = Path(raw_dir)
+    pdf_path = raw_path / target_filename
 
+    # If default target_filename does not exist, search for any PDF file in raw_dir
     if not pdf_path.exists():
-        print(f"\n[ERROR] Source PDF not found at: {pdf_path.resolve()}")
-        print(f"Please place your PDF at '{pdf_path}' and run this script again.")
-        return
+        pdf_files = list(raw_path.glob("*.pdf"))
+        if pdf_files:
+            pdf_path = pdf_files[0]
+            target_filename = pdf_path.name
+            print(f"[INFO] Using detected PDF file: '{target_filename}'")
+        else:
+            print(f"\n[ERROR] Source PDF not found in: {raw_path.resolve()}")
+            print("Please place your PDF in 'data/raw/' and run this script again.")
+            return
+
+    output_path = Path(processed_dir) / "chunks.json"
 
     # Create processed directory if it doesn't exist
     output_path.parent.mkdir(parents=True, exist_ok=True)
