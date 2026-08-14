@@ -29,22 +29,57 @@ def count_tokens(text: str) -> int:
     return len(ENCODER.encode(text))
 
 
-def split_into_sentences(text: str) -> List[str]:
+def split_into_units(text: str, max_unit_tokens: int = 150) -> List[str]:
     """
-    Splits raw text into individual sentences using regex boundary matching.
+    Splits text into small semantic units (sentences or table lines).
     
-    Using regex sentence segmentation ensures we do not cut sentences in half
-    during chunking, preserving grammatical and semantic structure.
+    If text contains financial tables or unpunctuated lines, splitting strictly 
+    on [.!?] punctuation will lump an entire page-long table into a single unit.
+    This function splits by lines and sentences, and enforces a hard token ceiling
+    on any individual unit.
     """
-    # Clean up whitespace and newlines for cleaner text
-    cleaned_text = re.sub(r'\s+', ' ', text).strip()
-    if not cleaned_text:
+    if not text or not text.strip():
         return []
-    
-    # Split on sentence-ending punctuation followed by whitespace or quote
-    sentence_end_pattern = r'(?<=[.!?])\s+(?=[A-Z0-9"])'
-    sentences = re.split(sentence_end_pattern, cleaned_text)
-    return [s.strip() for s in sentences if s.strip()]
+
+    lines = text.split('\n')
+    units = []
+
+    for line in lines:
+        cleaned_line = line.strip()
+        if not cleaned_line:
+            continue
+
+        # Split line on standard sentence-ending punctuation if present
+        sentence_end_pattern = r'(?<=[.!?])\s+(?=[A-Z0-9"])'
+        sentences = re.split(sentence_end_pattern, cleaned_line)
+
+        for s in sentences:
+            s_clean = s.strip()
+            if not s_clean:
+                continue
+
+            s_tokens = count_tokens(s_clean)
+            # If a unit (e.g. unpunctuated financial table block) exceeds max_unit_tokens,
+            # break it down into sub-units by word groups.
+            if s_tokens > max_unit_tokens:
+                words = s_clean.split(' ')
+                sub_unit = []
+                sub_count = 0
+                for w in words:
+                    wt = count_tokens(w + ' ')
+                    if sub_count + wt > max_unit_tokens and sub_unit:
+                        units.append(' '.join(sub_unit))
+                        sub_unit = [w]
+                        sub_count = wt
+                    else:
+                        sub_unit.append(w)
+                        sub_count += wt
+                if sub_unit:
+                    units.append(' '.join(sub_unit))
+            else:
+                units.append(s_clean)
+
+    return units
 
 
 def extract_text_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, Any]], List[int]]:
@@ -81,25 +116,6 @@ def extract_text_from_pdf(pdf_path: str) -> Tuple[List[Dict[str, Any]], List[int
     return pages_data, failed_pages
 
 
-"""
-===============================================================================
-OVERLAP MECHANISM EXPLANATION:
-===============================================================================
-When chunking documents for RAG, cutting text strictly at a fixed token limit 
-(e.g., exactly at 700 tokens) risks splitting sentences mid-phrase or separating
-a key statement from its preceding context.
-
-To solve this:
-1. We group text into full sentences.
-2. We accumulate sentences into a Chunk N until its size reaches 500-800 tokens.
-3. When Chunk N is completed, we don't start Chunk N+1 from the very next sentence.
-   Instead, we step backwards by ~100 tokens worth of full sentences from the end 
-   of Chunk N.
-4. Chunk N+1 begins with these overlapping sentences, providing "sliding context"
-   so that queries matching text near a chunk boundary still retrieve full context.
-===============================================================================
-"""
-
 def create_chunks_with_overlap(
     pages_data: List[Dict[str, Any]],
     source_doc_name: str,
@@ -108,54 +124,52 @@ def create_chunks_with_overlap(
     overlap_tokens: int = 100
 ) -> List[Dict[str, Any]]:
     """
-    Converts page-level text into sentence-bounded chunks with token overlap.
+    Converts page-level text into bounded chunks with token overlap.
+    Handles standard prose as well as dense unpunctuated financial tables cleanly.
     """
-    # Step 1: Flatten all sentences across all pages while recording page attribution
-    all_sentences = []
+    # Step 1: Flatten all units across all pages while recording page attribution
+    all_units = []
     for page in pages_data:
         page_num = page["page_number"]
-        sentences = split_into_sentences(page["text"])
-        for s in sentences:
-            tokens = count_tokens(s)
-            all_sentences.append({
-                "text": s,
+        units = split_into_units(page["text"], max_unit_tokens=150)
+        for u in units:
+            all_units.append({
+                "text": u,
                 "page_number": page_num,
-                "token_count": tokens
+                "token_count": count_tokens(u)
             })
 
     chunks = []
     chunk_index = 1
-    total_sentences = len(all_sentences)
+    total_units = len(all_units)
     current_start = 0
 
-    while current_start < total_sentences:
-        current_chunk_sentences = []
+    while current_start < total_units:
+        current_chunk_units = []
         current_token_count = 0
         end_idx = current_start
-        start_page = all_sentences[current_start]["page_number"]
+        start_page = all_units[current_start]["page_number"]
 
-        # Step 2: Accumulate sentences up to target_max_tokens
-        while end_idx < total_sentences:
-            sentence_info = all_sentences[end_idx]
-            sentence_tokens = sentence_info["token_count"]
+        # Step 2: Accumulate units up to target_max_tokens
+        while end_idx < total_units:
+            unit_info = all_units[end_idx]
+            unit_tokens = unit_info["token_count"]
 
-            # If adding this sentence exceeds max tokens and we've already hit target_min_tokens, stop
-            if (current_token_count + sentence_tokens > target_max_tokens) and (current_token_count >= target_min_tokens):
+            if (current_token_count + unit_tokens > target_max_tokens) and (current_token_count >= target_min_tokens):
                 break
 
-            current_chunk_sentences.append(sentence_info)
-            current_token_count += sentence_tokens
+            current_chunk_units.append(unit_info)
+            current_token_count += unit_tokens
             end_idx += 1
 
-            # If single sentence is very long, force move forward
             if current_token_count >= target_max_tokens:
                 break
 
-        if not current_chunk_sentences:
-            break
+        if not current_chunk_units:
+            current_chunk_units = [all_units[current_start]]
+            end_idx = current_start + 1
 
-        # Assemble text for the chunk
-        chunk_text = " ".join(s["text"] for s in current_chunk_sentences)
+        chunk_text = " ".join(u["text"] for u in current_chunk_units)
         actual_token_count = count_tokens(chunk_text)
 
         chunks.append({
@@ -168,22 +182,19 @@ def create_chunks_with_overlap(
 
         chunk_index += 1
 
-        # If we reached the end of all sentences, exit loop
-        if end_idx >= total_sentences:
+        if end_idx >= total_units:
             break
 
-        # Step 3: Calculate overlap for the next chunk's starting index
-        # Work backwards from end_idx accumulating ~overlap_tokens
+        # Step 3: Calculate overlap for next chunk
         accumulated_overlap = 0
         next_start = end_idx
 
         for rev_idx in range(end_idx - 1, current_start, -1):
-            accumulated_overlap += all_sentences[rev_idx]["token_count"]
+            accumulated_overlap += all_units[rev_idx]["token_count"]
             if accumulated_overlap >= overlap_tokens:
                 next_start = rev_idx
                 break
 
-        # Ensure forward progress to prevent infinite loop
         if next_start <= current_start:
             next_start = current_start + 1
 
