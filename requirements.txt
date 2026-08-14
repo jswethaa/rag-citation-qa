@@ -1,0 +1,13 @@
+# Core Ingestion Dependencies (Day 1)
+pdfplumber>=0.10.3
+tiktoken>=0.6.0
+nltk>=3.8.1
+
+# Future RAG Pipeline Dependencies (Day 2+)
+# sentence-transformers>=2.5.0
+# chromadb>=0.4.22
+# rank-bm25>=0.2.2
+# anthropic>=0.18.0
+# fastapi>=0.110.0
+# uvicorn>=0.28.0
+# streamlit>=1.32.0
